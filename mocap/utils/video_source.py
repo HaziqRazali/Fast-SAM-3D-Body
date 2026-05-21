@@ -205,9 +205,66 @@ class VideoFileSource(VideoSource):
         return self.gravity_direction
 
 
+class WebcamSource(VideoSource):
+    """Standard USB/built-in webcam via OpenCV VideoCapture."""
+
+    def __init__(self, device_index: int = 0, width: int = 640, height: int = 480, fps: float = 30):
+        self.cap = cv2.VideoCapture(device_index)
+        if not self.cap.isOpened():
+            raise RuntimeError(f"Failed to open webcam at device index {device_index}")
+
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        self.cap.set(cv2.CAP_PROP_FPS, fps)
+
+        self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self._fps = float(self.cap.get(cv2.CAP_PROP_FPS)) or fps
+
+        # Estimate intrinsics from a typical 70-degree horizontal FOV
+        fov_rad = 70.0 * np.pi / 180.0
+        fx = (self.width / 2.0) / np.tan(fov_rad / 2.0)
+        fy = fx
+        cx = self.width / 2.0
+        cy = self.height / 2.0
+        self.cam_intrinsics = np.array(
+            [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float32
+        )[None, ...]
+
+        # Assume camera is upright — gravity points downward in camera space
+        self._gravity_direction = np.array([0.0, -1.0, 0.0], dtype=np.float64)
+
+        print(f"Webcam opened: device={device_index}, {self.width}x{self.height} @ {self._fps:.1f}fps")
+        print(f"  Estimated intrinsics: fx={fx:.1f}, fy={fy:.1f}, cx={cx:.1f}, cy={cy:.1f}")
+
+    def get_frame(self) -> tuple[np.ndarray, float]:
+        ret, frame = self.cap.read()
+        if not ret:
+            return None, None
+        return frame, time.time()
+
+    def release(self):
+        self.cap.release()
+
+    @property
+    def fps(self) -> float:
+        return self._fps
+
+    def get_camera_intrinsics(self) -> np.ndarray:
+        return self.cam_intrinsics
+
+    def get_frame_size(self) -> tuple[int, int]:
+        return self.width, self.height
+
+    def get_gravity_direction(self) -> np.ndarray:
+        return self._gravity_direction
+
+
 def create_video_source(source_type, **kwargs):
     if source_type == "camera":
         return RealSenseSource(**kwargs)
+    if source_type == "webcam":
+        return WebcamSource(**kwargs)
     if source_type == "video":
         return VideoFileSource(**kwargs)
     raise ValueError(f"Unknown source type: {source_type}")

@@ -36,6 +36,8 @@ from mocap.realtime.publisher import ZMQPublisher
 from mocap.core.setup_estimator import build_default_estimator
 from mocap.utils.pose_protocol import prepare_publish_pose
 from mocap.utils.video_source import create_video_source
+from sam_3d_body.visualization.skeleton_visualizer import SkeletonVisualizer
+from sam_3d_body.metadata.mhr70 import pose_info as mhr70_pose_info
 
 
 FOV_MODEL_SIZE = "s"
@@ -62,6 +64,7 @@ class RealtimePublisher:
         record=False,
         record_dir="output/records",
         min_person_confidence=0.75,
+        preview=False,
     ):
         logger.info("Initializing Realtime Publisher...")
         self.min_person_confidence = min_person_confidence
@@ -102,6 +105,13 @@ class RealtimePublisher:
             [[-1, 0, 0], [0, 0, 1], [0, 1, 0]], dtype=np.float64
         )
         self.R_world_cam = R_zup_adjustment @ self.R_world_cam
+
+        self.preview = preview
+        if self.preview:
+            self._skeleton_vis = SkeletonVisualizer(line_width=2, radius=5)
+            self._skeleton_vis.set_pose_meta(mhr70_pose_info)
+        self._preview_frame = None
+        self._preview_lock = threading.Lock()
 
         self.record = record
         self.record_dir = record_dir
@@ -317,11 +327,36 @@ class RealtimePublisher:
                         "Pose publishing paused (not exactly 1 confident person detected)."
                     )
                     self._publish_enabled = False
+                if self.preview:
+                    with self._preview_lock:
+                        self._preview_frame = frame.copy()
                 continue
 
             if not self._publish_enabled:
                 logger.info("Exactly 1 person confirmed; resuming pose publishing.")
                 self._publish_enabled = True
+
+            if self.preview:
+                out0 = outputs[0]
+                kp2d = out0.get("pred_keypoints_2d")
+                vis_frame = frame.copy()
+                if kp2d is not None:
+                    kp2d_conf = np.concatenate(
+                        [kp2d, np.ones((kp2d.shape[0], 1))], axis=-1
+                    )
+                    vis_frame = self._skeleton_vis.draw_skeleton(
+                        cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR), kp2d_conf
+                    )
+                    bbox = out0.get("bbox")
+                    if bbox is not None:
+                        cv2.rectangle(
+                            vis_frame,
+                            (int(bbox[0]), int(bbox[1])),
+                            (int(bbox[2]), int(bbox[3])),
+                            (0, 255, 0), 2,
+                        )
+                with self._preview_lock:
+                    self._preview_frame = vis_frame
 
             t0 = time.perf_counter()
             out = outputs[0]
@@ -633,7 +668,17 @@ class RealtimePublisher:
             ):
                 self.running = False
                 break
-            time.sleep(0.05)
+            if self.preview:
+                with self._preview_lock:
+                    frame_to_show = self._preview_frame
+                if frame_to_show is not None:
+                    cv2.imshow("SAM 3D Body - Preview", frame_to_show)
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("q") or key == 27:  # q or Esc
+                    self.running = False
+                    break
+            else:
+                time.sleep(0.05)
 
         if self.capture_thread.is_alive():
             self.capture_thread.join(timeout=1.0)
@@ -669,6 +714,8 @@ class RealtimePublisher:
         self._log_final_stats()
 
         self.publisher.close()
+        if self.preview:
+            cv2.destroyAllWindows()
         self._closed = True
 
 
@@ -680,7 +727,7 @@ def main():
         "--source",
         type=str,
         default="camera",
-        choices=["camera", "video"],
+        choices=["camera", "webcam", "video"],
         help="Video source type",
     )
     parser.add_argument(
@@ -764,7 +811,13 @@ def main():
         help="Directory to save recordings (default: output/records)",
     )
     parser.add_argument(
+        "--preview",
+        action="store_true",
+        help="Show live preview window with 2D skeleton overlay (press q or Esc to quit)",
+    )
+    parser.add_argument(
         "--min-person-confidence",
+
         type=float,
         default=0.75,
         help=(
@@ -782,6 +835,8 @@ def main():
 
     if args.source == "camera":
         video_source = create_video_source("camera", width=848, height=480, fps=30)
+    elif args.source == "webcam":
+        video_source = create_video_source("webcam", device_index=0, width=640, height=480, fps=30)
     else:
         if not args.video:
             parser.error("--video required when --source video")
@@ -809,6 +864,7 @@ def main():
         record=args.record,
         record_dir=args.record_dir,
         min_person_confidence=args.min_person_confidence,
+        preview=args.preview,
     )
 
     try:
