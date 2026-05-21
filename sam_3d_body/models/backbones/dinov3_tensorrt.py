@@ -52,6 +52,12 @@ class TRTDinov3Backbone(nn.Module):
         self._context = None
         self._initialized = False
 
+        # Pre-allocated I/O buffers (created on first forward, reused every frame).
+        # Stable GPU addresses let the surrounding torch.compile CUDA graph skip
+        # the input-copy step it would otherwise need for dynamic-address tensors.
+        self._input_buffer: torch.Tensor | None = None
+        self._output_buffer: torch.Tensor | None = None
+
     def _init_engine(self):
         """Initialize TensorRT engine (lazy loading)."""
         if self._initialized:
@@ -101,26 +107,27 @@ class TRTDinov3Backbone(nn.Module):
 
         batch_size = x.shape[0]
 
-        # Set input shape for dynamic batch
-        self._context.set_input_shape(self.input_name, tuple(x.shape))
+        # Allocate persistent I/O buffers on first call (or if batch size changes).
+        if self._output_buffer is None or self._output_buffer.shape[0] != batch_size:
+            self._input_buffer = torch.empty(
+                batch_size, x.shape[1], x.shape[2], x.shape[3],
+                device=x.device, dtype=torch.float16
+            )
+            self._output_buffer = torch.empty(
+                batch_size, self.embed_dim, self.output_size[0], self.output_size[1],
+                device=x.device, dtype=torch.float16
+            )
+            self._context.set_input_shape(self.input_name, tuple(self._input_buffer.shape))
+            self._context.set_tensor_address(self.input_name, self._input_buffer.data_ptr())
+            self._context.set_tensor_address(self.output_name, self._output_buffer.data_ptr())
 
-        # Allocate output buffer (FP16)
-        output = torch.empty(
-            batch_size, self.embed_dim, self.output_size[0], self.output_size[1],
-            device=x.device, dtype=torch.float16
-        )
-
-        # Convert input to FP16 and ensure contiguous
-        x_fp16 = x.to(dtype=torch.float16).contiguous()
-
-        # Set tensor addresses
-        self._context.set_tensor_address(self.input_name, x_fp16.data_ptr())
-        self._context.set_tensor_address(self.output_name, output.data_ptr())
+        # Copy input into the static buffer (FP16 cast + contiguous in one step)
+        self._input_buffer.copy_(x)
 
         # Execute asynchronously (PyTorch will synchronize when needed)
         self._context.execute_async_v3(torch.cuda.current_stream().cuda_stream)
 
-        return output
+        return self._output_buffer
 
     def get_layer_depth(self, param_name: str, prefix: str = "encoder."):
         """

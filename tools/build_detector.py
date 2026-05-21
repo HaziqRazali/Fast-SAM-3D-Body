@@ -227,7 +227,6 @@ def run_yolo11(
         )
         boxes = boxes[sorted_indices]
 
-    print(f"          [DEBUG] YOLO11 detected {len(boxes)} person(s)")
     return boxes
 
 
@@ -292,7 +291,7 @@ def run_yolo_pose(
 
     # Run YOLO-Pose inference
     if is_engine:
-        print(f"          [DEBUG] YOLO-Pose using TensorRT engine")
+        pass  # TensorRT engine path
     results = detector(img, **inference_kwargs)
 
     boxes_list = []
@@ -344,8 +343,6 @@ def run_yolo_pose(
         )
         boxes = boxes[sorted_indices]
         keypoints = keypoints[sorted_indices]
-
-    print(f"          [DEBUG] YOLO-Pose detected {len(boxes)} person(s)")
 
     # Return dict with boxes and keypoints
     return {

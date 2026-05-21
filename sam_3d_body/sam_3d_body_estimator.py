@@ -223,9 +223,6 @@ class SAM3DBodyEstimator:
                 - yolo_pose: use hand boxes computed from YOLO-Pose wrist keypoints
                   (requires detector to be yolo_pose type)
         """
-        process_total_start = time.time()
-        print("      [process_one_image] Starting...")
-
         # clear all cached results
         self.batch = None
         self.image_embeddings = None
@@ -237,17 +234,13 @@ class SAM3DBodyEstimator:
             # If state is corrupted after CUDA Graph capture failure, skip empty_cache
             print(f"        [process_one_image] Warning: empty_cache failed: {e}")
 
-        t0 = time.time()
         if type(img) == str:
             img = load_image(img, backend="cv2", image_format="bgr")
             image_format = "bgr"
         else:
-            print("####### Please make sure the input image is in RGB format")
             image_format = "rgb"
         height, width = img.shape[:2]
-        print(f"        [process_one_image] load_image: {time.time() - t0:.4f}s")
 
-        t0 = time.time()
         yolo_pose_keypoints = None  # Will be set if using yolo_pose detector
         yolo_pose_body_boxes = None
         if bboxes is not None:
@@ -257,8 +250,6 @@ class SAM3DBodyEstimator:
             if image_format == "rgb":
                 img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
                 image_format = "bgr"
-            print("Running object detector...")
-            torch.cuda.synchronize()
             detection_result = self.detector.run_human_detection(
                 img,
                 det_cat_id=det_cat_id,
@@ -266,25 +257,19 @@ class SAM3DBodyEstimator:
                 nms_thr=nms_thr,
                 default_to_full_image=False,
             )
-            torch.cuda.synchronize()
 
             # Handle yolo_pose detector which returns dict with boxes and keypoints
             if isinstance(detection_result, dict):
                 boxes = detection_result["boxes"]
                 yolo_pose_keypoints = detection_result.get("keypoints", None)
                 yolo_pose_body_boxes = boxes.copy()  # Save body boxes for hand box computation
-                print(f"Found boxes: {boxes}")
-                if yolo_pose_keypoints is not None:
-                    print(f"Found keypoints shape: {yolo_pose_keypoints.shape}")
             else:
                 boxes = detection_result
-                print("Found boxes:", boxes)
 
             self.is_crop = True
         else:
             boxes = np.array([0, 0, width, height]).reshape(1, 4)
             self.is_crop = False
-        print(f"        [process_one_image] human_detection: {time.time() - t0:.4f}s")
 
         # If there are no detected humans, don't run prediction
         if len(boxes) == 0:
@@ -295,11 +280,9 @@ class SAM3DBodyEstimator:
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
         # Handle masks - either provided externally or generated via SAM2
-        t0 = time.time()
         masks_score = None
         if masks is not None:
             # Use provided masks - ensure they match the number of detected boxes
-            print(f"Using provided masks: {masks.shape}")
             assert (
                 bboxes is not None
             ), "Mask-conditioned inference requires bboxes input!"
@@ -309,48 +292,31 @@ class SAM3DBodyEstimator:
             )  # Set high confidence for provided masks
             use_mask = True
         elif use_mask and self.sam is not None:
-            print("Running SAM to get mask from bbox...")
             # Generate masks using SAM2
-            torch.cuda.synchronize()
             masks, masks_score = self.sam.run_sam(img, boxes)
-            torch.cuda.synchronize()
         else:
             masks, masks_score = None, None
-        print(f"        [process_one_image] mask_processing: {time.time() - t0:.4f}s")
-
         #################### Construct batch data samples ####################
-        t0 = time.time()
         batch = prepare_batch(img, self.transform, boxes, masks, masks_score)
-        print(f"        [process_one_image] prepare_batch: {time.time() - t0:.4f}s")
 
         #################### Run model inference on an image ####################
-        t0 = time.time()
         batch = recursive_to(batch, "cuda")
         self.model._initialize_batch(batch)
-        print(f"        [process_one_image] initialize_batch: {time.time() - t0:.4f}s")
 
         # Handle camera intrinsics
         # - either provided externally or generated via default FOV estimator
-        t0 = time.time()
         if cam_int is not None:
-            print("Using provided camera intrinsics...")
             cam_int = cam_int.to(batch["img"])
             batch["cam_int"] = cam_int.clone()
         elif self.fov_estimator is not None:
-            print("Running FOV estimator ...")
             input_image = batch["img_ori"][0].data
-            torch.cuda.synchronize()
             cam_int = self.fov_estimator.get_cam_intrinsics(input_image).to(
                 batch["img"]
             )
-            torch.cuda.synchronize()
             batch["cam_int"] = cam_int.clone()
         else:
             cam_int = batch["cam_int"].clone()
-        print(f"        [process_one_image] fov_estimation: {time.time() - t0:.4f}s")
 
-        t0 = time.time()
-        torch.cuda.synchronize()
         outputs = self.model.run_inference(
             img,
             batch,
@@ -361,14 +327,11 @@ class SAM3DBodyEstimator:
             yolo_pose_keypoints=yolo_pose_keypoints,
             yolo_pose_body_boxes=yolo_pose_body_boxes,
         )
-        torch.cuda.synchronize()
-        print(f"        [process_one_image] model_run_inference: {time.time() - t0:.4f}s")
         if inference_type == "full":
             pose_output, batch_lhand, batch_rhand, _, _ = outputs
         else:
             pose_output = outputs
 
-        t0 = time.time()
         out = pose_output["mhr"]
         out = recursive_to(out, "cpu")
         out = recursive_to(out, "numpy")
@@ -437,6 +400,4 @@ class SAM3DBodyEstimator:
                     ]
                 )
 
-        print(f"        [process_one_image] postprocess_output: {time.time() - t0:.4f}s")
-        print(f"      [process_one_image] TOTAL: {time.time() - process_total_start:.4f}s")
         return all_out
