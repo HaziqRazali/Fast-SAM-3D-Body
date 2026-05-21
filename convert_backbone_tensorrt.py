@@ -54,14 +54,14 @@ CHECKPOINT_DIR = os.path.join(parent_dir, "checkpoints", "sam-3d-body-dinov3")
 TRT_OUTPUT_DIR = os.path.join(CHECKPOINT_DIR, "backbone_trt")
 ONNX_PATH = os.path.join(TRT_OUTPUT_DIR, "backbone_dinov3.onnx")
 TRT_PATH_BF16 = os.path.join(TRT_OUTPUT_DIR, "backbone_dinov3_bf16.engine")
-TRT_PATH_FP16 = os.path.join(TRT_OUTPUT_DIR, "backbone_dinov3_fp16.engine")
+TRT_PATH_FP16 = os.path.join(TRT_OUTPUT_DIR, "backbone_dinov3_384_fp16.engine")
 TRT_PATH = TRT_PATH_FP16  # Default to FP16 for better TensorRT optimization
 
 # Model config
-IMAGE_SIZE = (512, 512)  # H, W
+IMAGE_SIZE = (384, 384)  # H, W
 EMBED_DIM = 1280  # dinov3_vith16plus
 PATCH_SIZE = 16
-OUTPUT_SIZE = (32, 32)  # 512 / 16 = 32
+OUTPUT_SIZE = (24, 24)  # 384 / 16 = 24
 
 
 class BackboneWrapper(nn.Module):

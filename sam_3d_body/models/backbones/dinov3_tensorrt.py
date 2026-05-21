@@ -58,6 +58,12 @@ class TRTDinov3Backbone(nn.Module):
         self._input_buffer: torch.Tensor | None = None
         self._output_buffer: torch.Tensor | None = None
 
+        # Actual spatial size of the TRT engine's input/output (read from engine at
+        # init time).  May differ from output_size * patch_size when the engine was
+        # built for a smaller resolution than the rest of the model expects.
+        self._trt_h: int | None = None
+        self._trt_w: int | None = None
+
     def _init_engine(self):
         """Initialize TensorRT engine (lazy loading)."""
         if self._initialized:
@@ -84,8 +90,14 @@ class TRTDinov3Backbone(nn.Module):
         self.input_name = "input"
         self.output_name = "output"
 
+        # Read the engine's actual fixed spatial input dimensions.
+        # For a dynamic-batch engine the shape is (-1, 3, H, W); spatial dims are fixed.
+        trt_in_shape = self._engine.get_tensor_shape(self.input_name)
+        self._trt_h = int(trt_in_shape[2])
+        self._trt_w = int(trt_in_shape[3])
+
         self._initialized = True
-        print(f"[TRTDinov3Backbone] Engine loaded successfully")
+        print(f"[TRTDinov3Backbone] Engine loaded successfully (TRT input: {self._trt_h}×{self._trt_w})")
 
     def forward(self, x, extra_embed=None):
         """
@@ -107,25 +119,50 @@ class TRTDinov3Backbone(nn.Module):
 
         batch_size = x.shape[0]
 
-        # Allocate persistent I/O buffers on first call (or if batch size changes).
-        if self._output_buffer is None or self._output_buffer.shape[0] != batch_size:
+        # Resize input to the TRT engine's fixed spatial dimensions if needed.
+        # This allows the engine to run at a smaller resolution than IMAGE_SIZE
+        # (e.g. engine built for 384×384 while the rest of the model uses 512×512).
+        if x.shape[2] != self._trt_h or x.shape[3] != self._trt_w:
+            x_in = torch.nn.functional.interpolate(
+                x.float(), size=(self._trt_h, self._trt_w),
+                mode='bilinear', align_corners=False
+            ).half()
+        else:
+            x_in = x.half() if x.dtype != torch.float16 else x
+
+        # Allocate persistent I/O buffers sized for the TRT engine (on first call
+        # or if batch size changes).  Buffer sizes match engine dims, not IMAGE_SIZE.
+        if self._input_buffer is None or self._input_buffer.shape[0] != batch_size:
             self._input_buffer = torch.empty(
-                batch_size, x.shape[1], x.shape[2], x.shape[3],
+                batch_size, 3, self._trt_h, self._trt_w,
                 device=x.device, dtype=torch.float16
             )
+            trt_out_h = self._trt_h // self.patch_size
+            trt_out_w = self._trt_w // self.patch_size
             self._output_buffer = torch.empty(
-                batch_size, self.embed_dim, self.output_size[0], self.output_size[1],
+                batch_size, self.embed_dim, trt_out_h, trt_out_w,
                 device=x.device, dtype=torch.float16
             )
             self._context.set_input_shape(self.input_name, tuple(self._input_buffer.shape))
             self._context.set_tensor_address(self.input_name, self._input_buffer.data_ptr())
             self._context.set_tensor_address(self.output_name, self._output_buffer.data_ptr())
 
-        # Copy input into the static buffer (FP16 cast + contiguous in one step)
-        self._input_buffer.copy_(x)
+        # Copy (possibly resized) input into the static TRT buffer
+        self._input_buffer.copy_(x_in)
 
         # Execute asynchronously (PyTorch will synchronize when needed)
         self._context.execute_async_v3(torch.cuda.current_stream().cuda_stream)
+
+        # Bilinear-upsample output to the expected spatial size (output_size) if the
+        # TRT engine output is smaller (e.g. 24×24 from 384-engine vs 32×32 expected).
+        trt_out_h = self._trt_h // self.patch_size
+        trt_out_w = self._trt_w // self.patch_size
+        exp_h, exp_w = self.output_size
+        if trt_out_h != exp_h or trt_out_w != exp_w:
+            return torch.nn.functional.interpolate(
+                self._output_buffer.float(), size=(exp_h, exp_w),
+                mode='bilinear', align_corners=False
+            ).half()
 
         return self._output_buffer
 
