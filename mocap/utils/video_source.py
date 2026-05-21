@@ -209,10 +209,27 @@ class WebcamSource(VideoSource):
     """Standard USB/built-in webcam via OpenCV VideoCapture."""
 
     def __init__(self, device_index: int = 0, width: int = 640, height: int = 480, fps: float = 30):
-        self.cap = cv2.VideoCapture(device_index)
+        import sys as _sys
+        # On Linux, opening by device-path string with CAP_V4L2 is more reliable
+        # than integer index: some USB cameras fail V4L2's index-based lookup
+        # ("can't open camera by index") and fall back to FFMPEG, which then
+        # decodes only the Y-luma channel — producing a grayscale image even
+        # from a colour camera.  The string path skips that lookup entirely.
+        if _sys.platform.startswith("linux") and isinstance(device_index, int):
+            self.cap = cv2.VideoCapture(f"/dev/video{device_index}", cv2.CAP_V4L2)
+        else:
+            self.cap = cv2.VideoCapture(device_index)
+        if not self.cap.isOpened():
+            # Fallback: let OpenCV pick the backend
+            self.cap = cv2.VideoCapture(device_index)
         if not self.cap.isOpened():
             raise RuntimeError(f"Failed to open webcam at device index {device_index}")
 
+        # Force MJPEG before setting resolution — many USB webcams default to
+        # YUYV/NV12 at certain sizes, which OpenCV may decode incorrectly
+        # (producing a grayscale or corrupted image).  MJPEG is universally
+        # supported and guarantees a proper BGR output from VideoCapture.
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         self.cap.set(cv2.CAP_PROP_FPS, fps)
