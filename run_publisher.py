@@ -368,7 +368,7 @@ class RealtimePublisher:
             pred_vertices = np.asarray(out["pred_vertices"], dtype=np.float32)
             pred_cam_t = np.asarray(out["pred_cam_t"], dtype=np.float32)
             body_quat_xyzw = self._compute_body_quat(out["global_rot"])
-            smpl_pose, canonical_joints, _betas, _weights = self.fusion_runner.infer(
+            smpl_pose, canonical_joints, _betas, _weights, _ = self.fusion_runner.infer(
                 [(pred_vertices, pred_cam_t)]
             )
             body_quat, smpl_joints, smpl_pose = self._prepare_publish_pose(

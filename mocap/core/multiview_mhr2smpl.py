@@ -273,6 +273,7 @@ class MultiViewFusionRunner:
             )
 
         joints = smpl_out.joints[0, :24].cpu().numpy().astype(np.float32)
+        smpl_verts = smpl_out.vertices[0].cpu().numpy().astype(np.float32)
         joints -= joints[0:1]
         if self._smoother is not None:
             self._smoother_buffer.append(joints.flatten())
@@ -283,4 +284,4 @@ class MultiViewFusionRunner:
             x = torch.from_numpy(window.reshape(1, -1).astype(np.float32)).to(self.device)
             with torch.no_grad():
                 joints = self._smoother(x)[0].cpu().numpy().reshape(24, 3).astype(np.float32)
-        return body_pose_np.reshape(21, 3), joints, betas_np, weights_np
+        return body_pose_np.reshape(21, 3), joints, betas_np, weights_np, smpl_verts

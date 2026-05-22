@@ -697,7 +697,7 @@ def main():
             pred_vertices = np.asarray(out["pred_vertices"], dtype=np.float32)
             pred_cam_t   = np.asarray(out["pred_cam_t"],    dtype=np.float32)
 
-            body_pose_aa, joints_canonical, betas, _ = fusion_runner.infer(
+            body_pose_aa, joints_canonical, betas, _, smpl_verts = fusion_runner.infer(
                 [(pred_vertices, pred_cam_t)]
             )
 
@@ -708,9 +708,12 @@ def main():
                 height_estimated = True
 
             # -- Build GMR frame dict --------------------------------------
-            # Global orientation from monocular estimation is unreliable (noisy
-            # pitch/roll/yaw), so we always use the canonical upright pose.
+            # Pass only the yaw (Y-axis) component from the monocular estimator.
+            # Pitch and roll are zeroed — monocular lean estimates are too noisy
+            # and could cause the robot to topple.
+            _global_rot_raw = np.asarray(out["global_rot"], dtype=np.float64).reshape(3)
             global_rot_euler = np.zeros(3, dtype=np.float64)
+            global_rot_euler[1] = _global_rot_raw[1]  # Y = yaw (left/right turn only)
             frame_dict = smpl_to_gmr_frame(
                 body_pose_aa=body_pose_aa,
                 joints_canonical=joints_canonical.astype(np.float64),
@@ -750,38 +753,71 @@ def main():
                     vis_frame = frame_bgr.copy()
 
                 if args.mesh_preview:
-                    _verts = out.get("pred_vertices")
-                    _cam_t = out.get("pred_cam_t")
-                    _focal = out.get("focal_length")
-                    _global_rot = out.get("global_rot")  # ZYX Euler (3,)
-                    if _verts is not None and _cam_t is not None and _focal is not None:
-                        try:
-                            _verts_np = np.asarray(_verts, dtype=np.float32)
-                            _cam_t_np = np.asarray(_cam_t, dtype=np.float32)
-                            # Zero global orientation: rotate vertices by inv(global_rot)
-                            # so the mesh is always shown upright regardless of camera pose
-                            if _global_rot is not None:
-                                _R_inv = Rotation.from_euler("ZYX", _global_rot).inv().as_matrix().astype(np.float32)
-                                _verts_np = _verts_np @ _R_inv.T
-                            # Render on a white background (standalone canonical view,
-                            # not overlaid on the camera image)
-                            h, w = vis_frame.shape[:2]
-                            _white_bg = np.ones((h, w, 3), dtype=np.uint8) * 255
-                            _renderer = _Renderer(focal_length=_focal, faces=estimator.faces)
-                            _mesh_panel = (
-                                _renderer(
-                                    _verts_np,
-                                    _cam_t_np,
-                                    _white_bg,
-                                    mesh_base_color=_MESH_COLOR,
-                                    scene_bg_color=(1, 1, 1),
-                                ) * 255
-                            ).astype(np.uint8)
-                            # Concatenate skeleton frame (left) + canonical mesh (right)
-                            vis_frame = np.concatenate([vis_frame, _mesh_panel], axis=1)
-                        except Exception as _e:
-                            import traceback as _tb; _tb.print_exc()
-                            pass  # never crash the inference loop on a render error
+                    try:
+                        _fh, _fw = vis_frame.shape[:2]
+                        _focal = float(out.get("focal_length") or 500.0)
+
+                        def _render_canonical(verts, faces, pw=None, ph=None):
+                            """Render verts on a white background, auto-scaled."""
+                            _rh = ph or _fh
+                            _rw = pw or _fw
+                            _bg = np.ones((_rh, _rw, 3), dtype=np.uint8) * 255
+                            v_min, v_max = verts.min(0), verts.max(0)
+                            center = (v_min + v_max) / 2
+                            extent = float(v_max[1] - v_min[1])  # body height
+                            cam_t_z = _focal * extent / (0.8 * _rh)
+                            cam_t = np.array([0.0, 0.0, cam_t_z], dtype=np.float32)
+                            r = _Renderer(focal_length=_focal, faces=faces)
+                            return (r(verts - center, cam_t, _bg,
+                                      mesh_base_color=_MESH_COLOR,
+                                      scene_bg_color=(1, 1, 1)) * 255).astype(np.uint8)
+
+                        def _label(img, text):
+                            """Stamp a small label in the top-left corner."""
+                            out = img.copy()
+                            cv2.putText(out, text, (8, 22),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (80, 80, 80), 1,
+                                        cv2.LINE_AA)
+                            return out
+
+                        # Half-width panels for SMPL multi-angle views
+                        _pw = _fw // 2
+
+                        # Rotation matrices in camera-space (Y-down, Z-forward):
+                        # rotate around Y-down axis to orbit the SMPL mesh.
+                        # Ry(+90°): side view — body's +X side faces cam
+                        # Ry(180°): back view
+                        _Ry90  = np.array([[ 0, 0, 1], [0, 1, 0], [-1, 0, 0]], np.float32)
+                        _Ry180 = np.array([[-1, 0, 0], [0, 1, 0], [ 0, 0,-1]], np.float32)
+                        _Ry270 = np.array([[ 0, 0,-1], [0, 1, 0], [ 1, 0, 0]], np.float32)
+
+                        # -- MHR panel: single front view (camera-space vertices)
+                        _mhr_panel = _label(
+                            _render_canonical(pred_vertices, estimator.faces),
+                            "MHR front")
+
+                        # -- SMPL panels (front / left-side / back / right-side)
+                        # SMPL body-space: Y-up, front faces +Z.
+                        # Renderer applies Rx(180°) which flips both Y and Z.
+                        # Flip Y (Y-up→Y-down) AND Z (front+Z→-Z) so that after
+                        # Rx(180°) the front ends up at +Z in OpenGL (closer to camera).
+                        _sv = smpl_verts * np.array([1., -1., -1.], np.float32)
+                        _smpl_f = _label(_render_canonical(_sv,              fusion_runner._smpl.faces, _pw), "SMPL front")
+                        _smpl_l = _label(_render_canonical(_sv @ _Ry90,      fusion_runner._smpl.faces, _pw), "SMPL left")
+                        _smpl_b = _label(_render_canonical(_sv @ _Ry180,     fusion_runner._smpl.faces, _pw), "SMPL back")
+                        _smpl_r = _label(_render_canonical(_sv @ _Ry270,     fusion_runner._smpl.faces, _pw), "SMPL right")
+                        # Stack into 2×2 grid, scale to single-panel size
+                        _smpl_grid = np.concatenate([
+                            np.concatenate([_smpl_f, _smpl_l], axis=1),
+                            np.concatenate([_smpl_b, _smpl_r], axis=1),
+                        ], axis=0)
+                        _smpl_panel = cv2.resize(_smpl_grid, (_fw, _fh),
+                                                 interpolation=cv2.INTER_AREA)
+
+                        # skeleton | MHR mesh | SMPL 2×2 grid
+                        vis_frame = np.concatenate([vis_frame, _mhr_panel, _smpl_panel], axis=1)
+                    except Exception as _e:
+                        import traceback as _tb; _tb.print_exc()
 
             # -- Publish result to main thread -----------------------------
             with _result_lock:
